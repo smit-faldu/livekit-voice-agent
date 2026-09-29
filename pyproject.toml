@@ -1,0 +1,17 @@
+[project]
+name = "livekit-voice-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi>=0.141.1",
+    "faster-whisper>=1.2.1",
+    "langchain-google-genai>=4.4.0",
+    "langgraph>=1.2.12",
+    "livekit-agents[langchain,openai,silero]~=1.8",
+    "livekit-api>=1.2.1",
+    "piper-tts>=1.8.0",
+    "python-dotenv>=1.2.3",
+    "uvicorn>=0.54.0",
+]

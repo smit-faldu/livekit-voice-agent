@@ -1,0 +1,50 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Phase 1 test client</title>
+  <script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
+  <style>body{font-family:system-ui;margin:2rem}pre{background:#111;color:#0f0;padding:1rem;min-height:12rem}</style>
+</head>
+<body>
+  <h1>Phase 1: join a room</h1>
+  <button id="join">Join + enable mic</button>
+  <button id="leave" disabled>Leave</button>
+  <pre id="log"></pre>
+<script>
+const { Room, RoomEvent } = LivekitClient;
+const log = (m) => (document.getElementById("log").textContent += m + "\n");
+let room;
+
+document.getElementById("join").onclick = async () => {
+  // 1. Ask our FastAPI backend for a token (it also dispatches the agent).
+  const key = localStorage.getItem("assistant-access-key") || prompt("Access key (APP_ACCESS_KEY in .env.local)");
+  const res = await fetch("/api/token", { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + key }, body: "{}" });
+  const { server_url, participant_token } = await res.json();
+  log("got token, connecting to " + server_url);
+
+  // 2. Connect to livekit-server. The SDK handles WebSocket signaling + WebRTC media.
+  room = new Room();
+  room.on(RoomEvent.ParticipantConnected, (p) => log("participant joined: " + p.identity));
+  room.on(RoomEvent.ParticipantDisconnected, (p) => log("participant left: " + p.identity));
+  room.on(RoomEvent.Disconnected, () => log("disconnected"));
+  await room.connect(server_url, participant_token);
+  log("connected to room " + room.name + " as " + room.localParticipant.identity);
+
+  // 3. Publish the microphone track.
+  await room.localParticipant.setMicrophoneEnabled(true);
+  log("mic published");
+  for (const p of room.remoteParticipants.values()) log("already in room: " + p.identity);
+
+  document.getElementById("join").disabled = true;
+  document.getElementById("leave").disabled = false;
+};
+
+document.getElementById("leave").onclick = async () => {
+  await room.disconnect();
+  document.getElementById("join").disabled = false;
+  document.getElementById("leave").disabled = true;
+};
+</script>
+</body>
+</html>
