@@ -144,6 +144,27 @@ Things to try: "What time is it?", "What is 17.5 percent of 2480?", then follow-
 
 ---
 
+## Run on Google Colab (one command)
+
+Colab accepts no incoming connections, so `colab_run.py` sets everything up and exposes it through **Cloudflare quick tunnels**: one for the web app, one for LiveKit signaling. The tunnels carry only HTTP/WebSocket. The WebRTC **audio** goes through a **TURN relay**, which both your browser and Colab reach outbound. The audio stays end-to-end encrypted between browser and LiveKit; the relay can't decrypt it.
+
+1. In Colab, open **Secrets** (key icon), enable notebook access, and add:
+   - `GOOGLE_API_KEY`
+   - TURN relay, either
+     - `CF_TURN_KEY_ID` + `CF_TURN_API_TOKEN`: Cloudflare dashboard → Realtime → TURN Server → create a key (free tier), or
+     - `TURN_HOST` + `TURN_USERNAME` + `TURN_CREDENTIAL`: any TURN provider (for example the metered.ca free tier; use its host such as `global.relay.metered.ca`).
+   - optional `APP_ACCESS_KEY` (otherwise a random one is printed)
+2. Run one cell:
+   ```
+   !git clone https://github.com/smit-faldu/livekit-voice-agent.git
+   %cd livekit-voice-agent
+   %run colab_run.py
+   ```
+   Use `%run`, not `!python`: only `%run` can read Colab secrets.
+3. Open the printed `https://….trycloudflare.com` link and enter the printed access key.
+
+The script installs uv, Node 22, livekit-server and cloudflared, downloads the models, and generates fresh LiveKit keys plus `livekit.yaml`. It then starts livekit-server, `server.py` and both tunnels. Logs go to `debug/colab-logs/`. Stop by interrupting the cell. The tunnel URLs change on every run.
+
 ## Test STT accuracy on your own voice
 
 Speech models differ most on *your* accent and mic, so measure on your voice:

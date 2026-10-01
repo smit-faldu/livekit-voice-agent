@@ -14,3 +14,4 @@ wheels/
 models/
 livekit-server.exe
 debug/
+livekit.yaml

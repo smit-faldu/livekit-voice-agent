@@ -73,7 +73,10 @@ def get_token(req: TokenRequest):
         .with_grants(api.VideoGrants(room_join=True, room=room, can_publish=True, can_subscribe=True))
         .with_room_config(api.RoomConfiguration(agents=[api.RoomAgentDispatch(agent_name=AGENT_NAME)]))
     )
-    return {"server_url": url, "participant_token": token.to_jwt()}
+    # The browser may need a different address than the agent: on Colab the agent uses
+    # ws://127.0.0.1:7880 while the browser comes in through a tunnel (wss://...).
+    public_url = os.getenv("LIVEKIT_PUBLIC_URL") or url
+    return {"server_url": public_url, "participant_token": token.to_jwt()}
 
 
 @app.get("/api/health")
