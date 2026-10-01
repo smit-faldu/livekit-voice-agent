@@ -13,3 +13,4 @@ wheels/
 .env.local
 models/
 livekit-server.exe
+debug/

@@ -464,3 +464,109 @@ Rules for `/api/token` (a **trust boundary**: a token = access to a room):
 - Streaming STT (sherpa-onnx) to cut the about-1.3 s transcript wait.
 - Ollama instead of Gemini for 100% offline.
 - More tools, such as notes or reminders.
+
+---
+
+## Phase 8: Streaming STT + LLM→TTS latency ✅
+
+**Goal**: cut the wait between "I stop talking" and "the agent speaks".
+
+### 8.1 Streaming STT (sherpa-onnx streaming Zipformer)
+**Built**: `agent/stt_streaming.py`, `SherpaStreamingSTT`, a *streaming* LiveKit STT plugin. The agent uses it now; Whisper stays as a fallback.
+
+**Batch vs streaming**
+```
+Whisper (batch):   [you talk .........][VAD silence][transcribe whole clip ~1.2 s] → text
+Zipformer (stream):[you talk: decode every 100 ms, partial text live][0.3 s silence → FINAL] → text
+```
+- **Transducer (RNN-T) model**: it emits tokens as audio arrives, keeping state between chunks. When I stop, only the last few hundred ms remain to decode.
+- **Plugin contract (streaming)**:
+  - `STTCapabilities(streaming=True, interim_results=True)`
+  - `stream()` returns a `RecognizeStream`
+  - `_run()` reads frames from `self._input_ch` and sends `INTERIM_TRANSCRIPT` / `FINAL_TRANSCRIPT` to `self._event_ch`
+  - `super().__init__(sample_rate=16000)` makes the framework resample 48 kHz → 16 kHz for me.
+- **Endpointing inside the STT**: `AgentSession` never flushes the STT when I stop, so the model must decide "utterance over" itself. `rule2_min_trailing_silence=0.3` = 0.3 s of silence after words means FINAL.
+- **Interim transcripts** = live captions. The frontend shows my words while I'm still speaking.
+
+**Bug found: the first ~2 s of every stream were ignored**
+- "What is the capital of Japan" became "Ol of japan". Even the model's own reference WAV lost "AFTER EARLY NIGHTFALL".
+- Token timestamps showed the first word at **2.04 s**: a fresh stream outputs nothing until its encoder has about 2 s of left context.
+- Fix: `new_stream()` feeds **2.5 s of silence** once when the stream is created. The stream then stays warm for the whole conversation (`reset()` after each sentence doesn't bring the problem back).
+- Result: 4 of 5 test clips exactly right. ("Hello" in the robotic Windows voice still comes out as "O".)
+
+**Measured**
+| | Whisper base.en (batch) | Zipformer 20M (streaming) |
+|---|---|---|
+| STT delay after speech ends (in the real agent) | 1.2–1.5 s | **0.48–0.78 s** |
+| CPU (RTF) | 0.2 | **0.03** |
+| Model on disk (int8) | 145 MB | **43 MB** |
+| Accuracy | better on odd words, punctuation | good; lowercase, no punctuation |
+
+**Endpoint silence trade-off**
+- 0.3 s → FINAL 0.45–0.8 s after speech, but "what is one hundred / twenty three…" splits at pauses.
+- 0.5 s → no splits, but 0.3 s slower.
+- Chose 0.3: splits are harmless because the **turn detector** (not the STT) decides the end of my turn, and split finals are joined into one turn.
+
+### 8.2 Does the LLM stream into TTS? Yes, already.
+```
+Gemini tokens → graph say() → LLMAdapter → AgentSession
+   → tts.StreamAdapter (auto, because Piper is non-streaming)
+   → blingfire sentence tokenizer (min 20 chars) → Piper per sentence → audio
+```
+- The first sentence is spoken while Gemini is still writing the rest.
+- New per-turn metric in the log: `first sentence to TTS` (`llm_node_ttfs`).
+  - Short answers: equal to the LLM's first token (no wait).
+  - Long first sentence (Tokyo answer): 0.5–0.76 s of waiting for the sentence to finish.
+- Tried asking Gemini for "a short first sentence": it didn't follow reliably, so I reverted it.
+- Possible next step: split at commas (clauses) as well. Saves about 0.3–0.7 s on long first sentences; costs choppier intonation.
+
+### 8.3 Preemptive generation (now ON)
+- With streaming STT, the transcript is ready **before** the turn detector confirms that I'm done.
+- `preemptive_generation={"enabled": True}` starts Gemini on it right away. If I keep talking, the draft is discarded.
+- Measured, same question with the same 2.5 s end-of-turn wait: total **3.9 s → 2.9 s**.
+- Cost: an extra Gemini call when I pause mid-thought and continue.
+
+### Results (e2e: I stop → agent speaks, on battery)
+| Setup | Typical e2e |
+|---|---|
+| Phase 7 (Whisper, no preemptive) | about 6 s |
+| Phase 8 (streaming STT + preemptive) | **about 2–3 s** when the turn detector is confident; math/tool questions still 4–7 s (Gemini variance + 2 LLM calls) |
+
+**Remaining bottlenecks**
+1. **Turn detector confidence**: with the robotic test voice it often scored about 0.33 against the 0.36 threshold and waited the full 2.5 s. Real voices score higher. Knob: `TurnDetector(unlikely_threshold=...)` (lower = replies sooner, but cuts you off more).
+2. **Gemini first token**: 0.9–6.8 s, varies with Google's load.
+
+**Commands**
+```
+uv run agent/stt_streaming.py speech_16k_mono.wav    # transcript + delay after speech end
+$env:AGENT_LOG_LEVEL="DEBUG"; uv run server.py       # see eot prediction probabilities
+```
+
+### 8.4 Why streaming lost accuracy, and the fix
+**Symptom (my real voice)**: "my name is John" came out wrong; streaming was fast but inaccurate.
+
+**Causes (two of them)**
+1. **Model too narrow**: Zipformer 20M was trained only on LibriSpeech (about 960 h of audiobooks: clean, read speech, mostly US/UK readers). My laptop mic, my accent and casual speech are outside that. Whisper saw 680,000 h of varied audio, which is why it was fine.
+   - My robot-voice and audiobook test clips couldn't reveal this: all models scored about the same on them. **Lesson: test speech models on the real user's voice.**
+2. **Bug: resets during silence dropped first words.** sherpa's "2.4 s of silence and no words" rule fired during pauses, and I reset the stream each time. A fresh stream needs warm context, so words spoken right after a reset were lost.
+   - Measured: "And how many people live there" became "Many people live there"; "What is" became "One is". So "**My name is** John" would lose its start.
+   - Fix: reset **only after a real sentence** (`ended = bool(text) and is_endpoint`).
+
+**New default: NVIDIA NeMo FastConformer streaming (80 ms lookahead, int8)**
+- Trained on a much broader English mix (conversational and telephone speech, Common Voice accents, and more).
+- Needs `endpoint_silence=0.5`: at 0.3 it split sentences and lost words at the split.
+| Model (live, my laptop) | Final text after I stop | CPU (RTF) | RAM |
+|---|---|---|---|
+| NeMo 80 ms (default) | about 0.25–0.75 s | about 0.23 | +331 MB |
+| NeMo 480 ms | about +0.4 s | about 0.10 | similar |
+| Zipformer 20M | about 0.5 s | 0.03 | +210 MB |
+| Whisper base.en (batch) | about 1.2–1.5 s | about 0.2 | +262 MB |
+- Live test after the fix: all 3 questions exact. "What is the capital of Japan" → answer audible after **1.47 s**.
+- ⚠️ Benchmarks swung up to 10x (NeMo RTF 1.9 → 0.23) depending on free RAM (0.4 GB!) and battery. Measure twice.
+
+**How to pick the best model for my voice**
+```
+$env:SAVE_UTTERANCES="debug/utterances"; uv run server.py     # talk; each sentence → .wav + .txt
+uv run agent/compare_stt.py debug/utterances                   # all models side by side (+ WER with .ref.txt)
+$env:STT_MODEL="nemo80"   # or nemo480 / zipformer20m / whisper
+```

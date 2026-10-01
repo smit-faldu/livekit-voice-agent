@@ -13,5 +13,6 @@ dependencies = [
     "livekit-api>=1.2.1",
     "piper-tts>=1.8.0",
     "python-dotenv>=1.2.3",
+    "sherpa-onnx>=1.13.8",
     "uvicorn>=0.54.0",
 ]

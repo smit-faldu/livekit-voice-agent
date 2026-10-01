@@ -1,6 +1,6 @@
 """The voice assistant: LiveKit AgentSession wiring all local pieces together.
 
-  mic -> Silero VAD -> turn detector -> WhisperSTT -> LangGraph (Gemini) -> PiperTTS -> speaker
+  mic -> Silero VAD -> turn detector -> streaming STT (sherpa-onnx) -> LangGraph (Gemini) -> PiperTTS -> speaker
 
 Everything runs on this machine except the Gemini call (text only).
 Normally started by `server.py` (one process for API + frontend + agent).
@@ -9,6 +9,7 @@ Standalone: uv run agent/main.py console   (terminal mic/speaker, no browser)
 
 import functools
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -30,11 +31,26 @@ from livekit.plugins import langchain, silero
 sys.path.insert(0, str(Path(__file__).parent.parent))  # `agent.` imports when run as a script
 from agent.graph import build_graph
 from agent.stt_local import WhisperSTT
+from agent.stt_streaming import SherpaStreamingSTT
 from agent.tts_local import PiperTTS
 
 load_dotenv(".env.local")
 logger = logging.getLogger("assistant")
 AGENT_NAME = "assistant"  # the token endpoint dispatches this name
+
+
+# Pick the STT with env STT_MODEL (try each on YOUR voice, see agent/compare_stt.py):
+#   zipformer20m  streaming, fastest, smallest; trained on audiobooks only -> weak on accents/real mics
+#   nemo80        streaming NVIDIA FastConformer, 80 ms lookahead; trained on far more varied speech
+#   nemo480       same model, 480 ms lookahead: more accurate, ~0.4 s more delay
+#   whisper       batch faster-whisper base.en: most robust, ~1 s slower (waits for the whole clip)
+STT_MODELS = {
+    "zipformer20m": lambda: SherpaStreamingSTT("sherpa-onnx-streaming-zipformer-en-20M-2023-02-17"),
+    # NeMo needs 0.5 s endpoint silence: at 0.3 s it splits sentences and drops words at the split.
+    "nemo80": lambda: SherpaStreamingSTT("sherpa-onnx-nemo-streaming-fast-conformer-transducer-en-80ms-int8", endpoint_silence=0.5),
+    "nemo480": lambda: SherpaStreamingSTT("sherpa-onnx-nemo-streaming-fast-conformer-transducer-en-480ms-int8", endpoint_silence=0.5),
+    "whisper": lambda: WhisperSTT(model="base.en"),
+}
 
 
 @functools.cache
@@ -44,7 +60,7 @@ def load_models() -> dict:
         # Turn detector needs VAD silence >= 0.25 s. It decides "finished?" from how you
         # sound, so VAD can stop waiting early and the model confirms the end of turn.
         "vad": silero.VAD.load(min_silence_duration=0.3),
-        "stt": WhisperSTT(model="base.en"),
+        "stt": STT_MODELS[os.getenv("STT_MODEL", "nemo80")](),
         "tts": PiperTTS(voice="en_US-lessac-low"),
     }
 
@@ -75,8 +91,8 @@ def log_turn_latency(ev: ConversationItemAddedEvent):
         )
     elif ev.item.role == "assistant" and "e2e_latency" in m:
         logger.info(
-            "🤖 %r | LLM first token %.2fs, TTS first audio %.2fs, total (you stop -> it speaks) %.2fs",
-            text, m.get("llm_node_ttft", 0), m.get("tts_node_ttfb", 0), m["e2e_latency"],
+            "🤖 %r | LLM first token %.2fs, first sentence to TTS %.2fs, TTS first audio %.2fs, total (you stop -> it speaks) %.2fs",
+            text, m.get("llm_node_ttft", 0), m.get("llm_node_ttfs", 0), m.get("tts_node_ttfb", 0), m["e2e_latency"],
         )
 
 
@@ -91,7 +107,10 @@ async def entrypoint(ctx: JobContext):
             turn_detection=inference.TurnDetector(version="v1-mini"),
             endpointing={"min_delay": 0.3, "max_delay": 2.5},  # wait 0.3 s if sure you're done, up to 2.5 s if unsure
             interruption={"mode": "vad"},  # barge-in via VAD ("adaptive" is cloud-only)
-            preemptive_generation={"enabled": False},  # one Gemini call per turn
+            # Start Gemini on the transcript while the turn detector is still deciding.
+            # Streaming STT delivers text early, so the answer is often ready when the turn ends
+            # (measured: 3.9 s -> 2.9 s). Cost: an extra Gemini call if you pause and keep talking.
+            preemptive_generation={"enabled": True},
         ),
     )
     session.on("conversation_item_added", log_turn_latency)

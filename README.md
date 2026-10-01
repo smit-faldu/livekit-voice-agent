@@ -7,7 +7,7 @@ A voice assistant you talk to in the browser, built on **LiveKit Agents** and ru
 | Media transport (WebRTC) | self-hosted `livekit-server` | local |
 | Voice activity detection | Silero VAD | local (CPU) |
 | Turn detection | LiveKit turn detector `v1-mini` | local (CPU) |
-| Speech-to-text | faster-whisper `base.en` | local (CPU) |
+| Speech-to-text | sherpa-onnx **streaming** NVIDIA NeMo FastConformer (80 ms, int8) | local (CPU) |
 | Brain | LangGraph + LangChain → **Gemini** (with tools) | Google API, **text only** |
 | Text-to-speech | Piper `en_US-lessac-low` | local (CPU) |
 | Web app + token API | React (Vite) + FastAPI | local |
@@ -20,7 +20,7 @@ Browser (React, livekit-client)
   │ 2. WebSocket + WebRTC audio ────────────────> livekit-server :7880
                                                       │ dispatches the job to the agent
                                                       ▼
-                       agent: Silero VAD → turn detector → Whisper → LangGraph/Gemini → Piper
+                       agent: Silero VAD → turn detector → streaming STT → LangGraph/Gemini → Piper
 ```
 
 ---
@@ -95,7 +95,16 @@ uv run python -c "import secrets; print(secrets.token_urlsafe(32))"
 `server.py` runs with Hugging Face **offline** (`HF_HUB_OFFLINE=1`) for privacy, so download the models once before the first start:
 
 ```
-# Speech-to-text: faster-whisper base.en (~145 MB) → models/whisper
+# Speech-to-text (streaming, default STT_MODEL=nemo80): NVIDIA NeMo FastConformer 80 ms, int8 (~98 MB) → models/sherpa
+mkdir models/sherpa
+curl -L -o models/sherpa/m.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-streaming-fast-conformer-transducer-en-80ms-int8.tar.bz2
+tar xjf models/sherpa/m.tar.bz2 -C models/sherpa
+del models\sherpa\m.tar.bz2          # (macOS/Linux: rm models/sherpa/m.tar.bz2)
+# Optional other streaming models (same 3 commands, different name):
+#   sherpa-onnx-nemo-streaming-fast-conformer-transducer-en-480ms-int8   (STT_MODEL=nemo480)
+#   sherpa-onnx-streaming-zipformer-en-20M-2023-02-17                     (STT_MODEL=zipformer20m)
+
+# Speech-to-text fallback (batch, optional): faster-whisper base.en (~145 MB) → models/whisper
 uv run python -c "from faster_whisper import WhisperModel; WhisperModel('base.en', download_root='models/whisper')"
 
 # Text-to-speech: Piper voice (~60 MB) → models/piper
@@ -106,7 +115,8 @@ Silero VAD and the turn detector come bundled with the Python packages, so they 
 
 Optional check that both work:
 ```
-uv run agent/stt_local.py some_speech.wav   # prints the transcript + speed
+uv run agent/stt_streaming.py speech_16k_mono.wav   # streaming STT: transcript + delay after speech ends
+uv run agent/stt_local.py some_speech.wav   # Whisper: transcript + speed
 uv run agent/tts_local.py "Hello there"      # writes models/tts_test.wav
 ```
 
@@ -134,6 +144,15 @@ Things to try: "What time is it?", "What is 17.5 percent of 2480?", then follow-
 
 ---
 
+## Test STT accuracy on your own voice
+
+Speech models differ most on *your* accent and mic, so measure on your voice:
+```
+$env:SAVE_UTTERANCES="debug/utterances"; uv run server.py   # talk in the browser; each sentence is saved as .wav + .txt
+uv run agent/compare_stt.py debug/utterances                 # every installed model on the same recordings
+```
+For a word error rate, add `<name>.ref.txt` with what you really said next to a `.wav`. Then pick the winner with `$env:STT_MODEL="..."`.
+
 ## Other ways to run
 
 | Goal | Command |
@@ -149,12 +168,15 @@ Things to try: "What time is it?", "What is 17.5 percent of 2480?", then follow-
 
 | What | Where | Default |
 |---|---|---|
-| Whisper model (`tiny.en` faster, `small.en` more accurate) | `agent/main.py` → `WhisperSTT(model=...)` | `base.en` |
+| STT engine | env `STT_MODEL` = `nemo80` / `nemo480` / `zipformer20m` / `whisper` (see `agent/main.py`) | `nemo80` |
+| Streaming STT end-of-sentence silence | `STT_MODELS` in `agent/main.py` → `endpoint_silence=` | 0.5 s NeMo, 0.3 s Zipformer |
 | Piper voice ([voice list](https://huggingface.co/rhasspy/piper-voices)) | `agent/main.py` → `PiperTTS(voice=...)` | `en_US-lessac-low` |
 | Gemini model and system prompt | `agent/graph.py` → `MODEL`, `SYSTEM_PROMPT` | `gemini-3.5-flash-lite` |
 | Tools | `agent/graph.py` → `TOOLS` | date/time, calculator |
 | Turn timing | `agent/main.py` → `endpointing`, VAD `min_silence_duration` | 0.3–2.5 s, 0.3 s |
-| CPU threads per model | `WhisperSTT(cpu_threads=)`, `PiperTTS(threads=)` | 4, 2 |
+| Preemptive generation (start Gemini before turn is confirmed) | `agent/main.py` → `preemptive_generation` | on |
+| CPU threads per model | `SherpaStreamingSTT(threads=)`, `WhisperSTT(cpu_threads=)`, `PiperTTS(threads=)` | 2, 4, 2 |
+| Debug logs (turn-detector predictions etc.) | PowerShell: `$env:AGENT_LOG_LEVEL="DEBUG"; uv run server.py` | INFO |
 | Port | `server.py` → `PORT` | 3000 |
 
 To switch Whisper model or Piper voice, download the new model first (step 5), because the server runs offline.
@@ -166,10 +188,13 @@ To switch Whisper model or Piper voice, download the new model first (step 5), b
 | Symptom | Fix |
 |---|---|
 | `port 3000 is already in use` | An old server is still running. Stop it (Task Manager → `python.exe`) and start again. |
+| Status "pre-connect-buffering" → "failed" | No agent is running. Start the app with `uv run server.py`, **not** `uvicorn backend.api:app` (that old command serves only the page and tokens, with no agent). |
 | Agent never joins / status "failed" | Is `livekit-server` running, and does `--keys` match `.env.local`? Is more than one agent worker running? |
 | `401` / "Wrong access key" | The browser key must equal `APP_ACCESS_KEY` in `.env.local`. |
 | Mic button crossed out | Allow microphone access for `localhost:3000` in the browser. |
 | Start does nothing | Click again or reload the page (a prefetched token can be stale after a server restart). |
+| Words wrong / names misheard | Record and compare models (section above); try `STT_MODEL=nemo480` or `whisper`. |
+| Start of a question missing in the transcript | Keep the warm-up in `SherpaStreamingSTT.new_stream()` and the "reset only after a sentence" rule in `SherpaRecognizeStream`; both prevent dropped first words. |
 | Slow replies | Plug in the laptop charger (the CPU is throttled on battery), close heavy apps, try `tiny.en`. The per-turn latency is printed in the server log. |
 | `LocalEntryNotFoundError` / model not found | Run the downloads in step 5. |
 | Gemini `503 Service Unavailable` | Google is overloaded; the client retries automatically. |
@@ -183,7 +208,9 @@ server.py          single entry point: FastAPI + built frontend + agent worker (
 agent/
   main.py          AgentSession: VAD, turn detector, STT, LLM, TTS, latency logs
   graph.py         LangGraph brain: Gemini + tools (spoken text via get_stream_writer)
-  stt_local.py     faster-whisper as a LiveKit STT plugin
+  stt_streaming.py sherpa-onnx streaming STT (NeMo / Zipformer) as a LiveKit STT plugin (used)
+  compare_stt.py   compare all STT models on recorded utterances (accuracy + speed)
+  stt_local.py     faster-whisper as a LiveKit STT plugin (batch fallback)
   tts_local.py     Piper as a LiveKit TTS plugin
 backend/api.py     /api/token (auth, 10-min tokens, agent dispatch), serves frontend/dist
 frontend/          React + Vite app (livekit-client, @livekit/components-react)

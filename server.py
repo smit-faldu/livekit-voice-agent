@@ -27,7 +27,8 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s", datefmt="%H:%M:%S")
 for noisy in ("httpx", "google_genai", "faster_whisper", "piper", "livekit", "livekit.agents.telemetry"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
-logging.getLogger("livekit.agents").setLevel(logging.INFO)  # worker registered, job received, errors
+# worker registered, job received, errors. AGENT_LOG_LEVEL=DEBUG shows turn-detector predictions etc.
+logging.getLogger("livekit.agents").setLevel(os.getenv("AGENT_LOG_LEVEL", "INFO"))
 log = logging.getLogger("server")
 
 
@@ -62,8 +63,24 @@ from agent.main import server as agent_server  # noqa: E402
 from backend.api import app  # noqa: E402
 
 
+async def check_livekit():
+    """Fail fast with a clear message if livekit-server is down or rejects our keys."""
+    from livekit import api
+
+    url = os.environ["LIVEKIT_URL"].replace("ws", "http", 1)
+    try:
+        async with api.LiveKitAPI(url=url) as lk:
+            await lk.room.list_rooms(api.ListRoomsRequest())
+    except Exception as e:
+        raise SystemExit(
+            f"cannot use LiveKit server at {url}: {e}\n"
+            f'start it first with the keys from .env.local:  livekit-server --dev --keys "<LIVEKIT_API_KEY>: <LIVEKIT_API_SECRET>"'
+        )
+
+
 @asynccontextmanager
 async def lifespan(_app):
+    await check_livekit()
     # The agent worker runs as a background task in the same event loop as FastAPI.
     # Jobs (conversations) run as threads in this process and share the loaded models.
     worker = asyncio.create_task(agent_server.run(devmode=False))
